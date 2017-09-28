@@ -1,0 +1,358 @@
+/****************************************Copyright(C),2017,xjz***************************************
+** 
+**  The software is very welcome for learning, teaching, research. 
+**  If you are used for business, please tell me.
+** 
+**  http://my.csdn.net/sdewenking
+**  xiejiezhang@gmail.com
+**--------------File Info---------------------------------------------------------------------------------
+** File name:           xmodem_r.h
+** Last modified Date:  2017-09-25
+** Last Version:         V1.0
+** Descriptions:        
+**
+**--------------------------------------------------------------------------------------------------------
+** Created by:          xjz
+** Created date:        2017-09-25
+** Version:             V1.00
+** Descriptions:        Create the file
+**
+**--------------------------------------------------------------------------------------------------------
+** Modified by:         
+** Modified date:       
+** Version:             
+** Descriptions:        
+**
+*********************************************************************************************************/
+#include "std.h"
+#include "xmodem_r.h"
+
+
+#define XMD_SOH  (0x1 )  /* header of xmodem pro. */
+#define XMD_STX  (0x2 )  /* header of xmodem-1k pro. */
+#define XMD_EOT  (0x4 )  /* end of transmit */
+#define XMD_ACK  (0x6 )  /* ack of corrent packet . */
+#define XMD_NAK  (0x15)  /* ack of incorrent packet */
+#define XMD_CAN  (0x18)  /* Revoke transmission */
+#define XMD_EOF  (0x1A)  /* the data of fill packet */
+
+
+#define RETRY_MAX_TIMES    10    /* Retry max times */
+#define RETRY_ONCE_TIME    5000  /* The interval between two retries */
+#define OVERTIMER_ONE_CHAR 100   /* Interval between characters */
+/**
+ *  | st  | pid | ~pid | pdat | crc |
+ *  | 1B  | 1B  |  1B  | nB   | 2B  |
+ *  
+ *  \note : n = 128  when st=SOH
+ *          n = 1024 when st=STX
+ */
+#define XMD_FORMAT
+
+
+typedef struct {
+
+    unsigned int  *ptiotMs;
+    unsigned char *pthBuf;
+    pfnRecvDone_t  pfnRecvDone;
+    pfnDatRecvCb_t datHandle;
+    unsigned int   threshole;
+    
+    pfnDatBytesSend_t sendHandle;
+
+    unsigned char  retryCnt;
+    unsigned char  lastPid;
+    unsigned int   rlen;
+
+    unsigned char  step;
+    unsigned short int   nRec;
+    unsigned short int   nCnt;
+    unsigned char  pid[2];
+    unsigned char  crc[2];
+
+#define SEND_CODE(x)    pXmd_r->sendCode=(x)|(0x80)
+#define IS_NEED_SEND()  (pXmd_r->sendCode & 0x80)
+#define GET_CODE()      (pXmd_r->sendCode & ~0x80)
+#define RESET_CODE()    (pXmd_r->sendCode &= ~0x80)
+    unsigned char  sendCode;
+    unsigned char  packetDone;
+
+    unsigned char  enable;
+    unsigned char  isDatRec;
+}xmodem_r_t;
+
+static xmodem_r_t gXmd_r[XMD_DEV_MAX];
+#define XMODE_DEV_ALLOC(pXmd_r, p_dev)  xmodem_r_t *pXmd_r = (xmodem_r_t *)(p_dev);
+#define XMODE_DEV_FIND_BY_ID(pXmd_r, id) xmodem_r_t *pXmd_r = (xmodem_r_t *)(&gXmd_r[id]);
+
+/**
+ * sendHandle : Character transmission interface
+ * ptiotMs : pointer of timeout param, tiot add one per macrosecond
+ * pthBuf: Receive byte of data buffer, 
+           must be Not less than 128 bytes when 128 TYPE,Not less than 1k bytes when 1K TYPE
+ */
+void xmodemConfig(char id,
+                  pfnRecvStart_t  pfnRecvStart,
+                  pfnDatBytesSend_t sendHandle,
+                  unsigned char *pthBuf,
+                  unsigned int  *ptiotMs)
+{
+    XMODE_DEV_FIND_BY_ID(pXmd_r, id);
+    STD_APCHK(sendHandle != NULL);
+    STD_APCHK(ptiotMs  != NULL);
+    STD_APCHK(pthBuf != NULL);
+
+    pXmd_r->sendHandle = sendHandle;
+    pXmd_r->ptiotMs   = ptiotMs;
+    pXmd_r->pthBuf    = pthBuf;
+}
+
+static unsigned short int xmodemCrc16(unsigned char *pbuf, unsigned int len)
+{  
+    unsigned short int crc;  
+    char i;  
+  
+    crc = 0;  
+    while (len--)  
+    {  
+        crc = crc ^ (unsigned short int) (*pbuf++ << 8);  
+        i = 8;  
+        do  
+        {  
+            if (crc & 0x8000)  
+                crc = crc << 1 ^ 0x1021;  
+            else  
+                crc = crc << 1;  
+        } while (--i);  
+    }  
+  
+    return (crc);  
+}  
+/**
+ * Start a transfer task
+ *
+ * datHandle : Data processing handle, 
+ *             The function is executed when the number of bytes received reaches the set threshold
+ *             Once the callback is executed, the buffer will be cleared
+ * threshole : Receive callback threshold
+ * 
+ * \note If an error occurs during transmission or overtime, the task is terminated.
+ *       Re-accept the need to recall the function.
+ */
+ void xmodemRecvTaskStart(void *p_dev,
+                          pfnRecvDone_t  pfnRecvDone,
+                          pfnDatRecvCb_t datHandle,
+                          unsigned int   threshole)
+{
+    XMODE_DEV_FIND_BY_ID(pXmd_r, id);
+    STD_APCHK(pXmd_r->sendHandle != NULL);
+    STD_APCHK(pXmd_r->datHandle != NULL);
+    STD_APCHK(pXmd_r->ptiotMs  != NULL);
+    STD_APCHK(pXmd_r->pthBuf != NULL);
+    pXmd_r->pfnRecvDone = pfnRecvDone;
+    pXmd_r->datHandle = datHandle;
+    pXmd_r->threshole = threshole;
+    
+    pXmd_r->retryCnt = 0;
+    pXmd_r->lastPid  = 0;
+
+    pXmd_r->packetDone = 0;
+    pXmd_r->step   = 0;
+    pXmd_r->nRec   = 0;
+    pXmd_r->rlen   = 0;
+    (*pXmd_r->ptiotMs) = 0;
+    SEND_CODE('C');
+
+    pXmd_r->enable    = 1;
+}
+
+enum {S_WaitStart, S_RecvData, S_SendACK, S_SendNAK, S_End};
+
+
+/**
+ * the character receives the function,
+ * call it when receive one char
+ * example: puts it on the character to receive the interrupt
+ */
+void xmodemOneCharRecv(void *p_dev, unsigned char c)
+{
+    XMODE_DEV_FIND_BY_ID(pXmd_r, id);
+    unsigned short int crcRec;
+
+    *(pXmd_r->ptiotMs) = 0;
+    if (IS_NEED_SEND()) {
+        return;
+    }
+    switch (pXmd_r->step)
+    {
+    case 0:
+        if (c == XMD_SOH) {
+            //128B
+            pXmd_r->nRec = 128;
+            pXmd_r->step = 1;
+        } else if (XMD_STX == c) {
+            //1K
+            pXmd_r->nRec = 1024;
+            pXmd_r->step = 1;
+        } else if ((XMD_EOT == c) && (pXmd_r->isDatRec != 0)) {
+            //Send ACK
+            pXmd_r->nRec = 1;
+            pXmd_r->step = 0;
+            SEND_CODE(XMD_ACK);
+        } else if (XMD_CAN == c) {
+            pXmd_r->step   = 0;
+            pXmd_r->nRec   = 0;
+            
+        }
+        break;
+
+    case 1:
+        pXmd_r->pid[0] = c;
+        pXmd_r->step = 2;
+        break;
+
+    case 2:
+        pXmd_r->pid[1] = c;
+        pXmd_r->step = 3;
+        pXmd_r->nCnt = 0;
+        if ((((pXmd_r->pid[0]) ^ pXmd_r->pid[1]) != 0xFF) || (((unsigned char)(pXmd_r->lastPid+1)) != pXmd_r->pid[0])) {
+            //Send NAK
+            pXmd_r->step = 0;
+            SEND_CODE(XMD_NAK);
+        } 
+        break;
+
+    case 3:
+        pXmd_r->pthBuf[pXmd_r->rlen+pXmd_r->nCnt] = c;
+        pXmd_r->nCnt++;
+        if (pXmd_r->nCnt >= pXmd_r->nRec) {
+            //All Data recv done.
+            pXmd_r->step = 4;
+        }
+        break;
+  
+    case 4:
+        pXmd_r->crc[0] = c;
+        pXmd_r->step   = 5;
+        break;
+
+    case 5:
+        pXmd_r->crc[1] = c;
+        pXmd_r->step   = 0;
+        crcRec = (pXmd_r->crc[0] << 8) | pXmd_r->crc[1];
+        if (xmodemCrc16(&pXmd_r->pthBuf[pXmd_r->rlen], pXmd_r->nRec) == crcRec) {
+            //Correct Packet
+            pXmd_r->rlen      += pXmd_r->nRec;
+            pXmd_r->packetDone = 1;
+            //Send A ACK
+            SEND_CODE(XMD_ACK);
+        } else {
+            //Send A NAK
+            SEND_CODE(XMD_NAK);
+        }
+        break;
+    }
+}
+
+/**
+ * Restart the receiving process
+ */
+void xmodemRestart(void *p_dev)
+{
+    XMODE_DEV_FIND_BY_ID(pXmd_r, id);
+    pXmd_r->retryCnt = 0;
+    pXmd_r->lastPid  = 0;
+
+    pXmd_r->packetDone = 0;
+    pXmd_r->step   = 0;
+    pXmd_r->nRec   = 0;
+    pXmd_r->rlen   = 0;
+    pXmd_r->isDatRec = 0;
+    if ((pXmd_r->ptiotMs))
+    {
+        (*pXmd_r->ptiotMs) = 0;
+    }
+    SEND_CODE('C');
+    RESET_CODE();
+    pXmd_r->sendHandle(&(pXmd_r->sendCode), 1);
+    pXmd_r->enable    = 1;
+}
+
+void xmodelRecvProcess(void *p_dev)
+{
+    XMODE_DEV_FIND_BY_ID(pXmd_r, id);
+    unsigned char *ptemp = 0;
+    //Check whether data has recvied!
+    if (pXmd_r->packetDone) {
+        pXmd_r->packetDone = 0;
+        ptemp = pXmd_r->pthBuf;
+        
+        while (pXmd_r->rlen >= pXmd_r->threshole) {
+            if(pXmd_r->datHandle(ptemp, pXmd_r->threshole) != 0) {
+                pXmd_r->enable = 0;
+                //Data handle Failure, Revoke transmission
+                SEND_CODE(XMD_CAN);
+                break;
+            }
+            pXmd_r->rlen -= pXmd_r->threshole;
+            ptemp       += pXmd_r->threshole;
+        }
+        pXmd_r->lastPid++;
+        pXmd_r->retryCnt = 0;
+        (*pXmd_r->ptiotMs) = 0;
+        
+        //Send ACK or CAN Frame
+        RESET_CODE();
+        pXmd_r->sendHandle(&(pXmd_r->sendCode), 1);
+        pXmd_r->isDatRec = 1;
+        return;
+    }
+    
+    //Check Wheter over time
+    if ((pXmd_r->nRec) && ((*pXmd_r->ptiotMs) >= OVERTIMER_ONE_CHAR)) {
+        pXmd_r->step   = 0;
+        (*pXmd_r->ptiotMs) = 0;
+        //pXmd_r->rlen   = 0;
+        if (IS_NEED_SEND()) {
+            RESET_CODE();
+            pXmd_r->sendHandle(&(pXmd_r->sendCode), 1);
+ 
+            if ((pXmd_r->nRec == 1) &&
+                (pXmd_r->sendCode == XMD_ACK) && 
+                (pXmd_r->pfnRecvDone)) {
+                //all Done
+                pXmd_r->pfnRecvDone();
+            }
+        }
+        pXmd_r->nRec   = 0;
+    }
+
+    //Check wheter start the recv process
+    if (pXmd_r->enable == 1) {
+        if (((*(pXmd_r->ptiotMs))>= RETRY_ONCE_TIME)) {
+            *(pXmd_r->ptiotMs) = 0;
+
+            pXmd_r->retryCnt++;
+            if (pXmd_r->retryCnt > RETRY_MAX_TIMES) {
+                pXmd_r->retryCnt = 0;
+                pXmd_r->lastPid  = 0;
+                pXmd_r->nRec     = 0;
+                pXmd_r->rlen     = 0;
+                //pXmd_r->enable   = 0;
+            } else {
+                if ((0 == pXmd_r->lastPid)) {
+                    SEND_CODE('C');
+                    RESET_CODE();
+                    pXmd_r->sendHandle(&(pXmd_r->sendCode), 1);
+                } else {
+                    SEND_CODE(XMD_NAK);
+                    RESET_CODE();
+                    pXmd_r->sendHandle(&(pXmd_r->sendCode), 1);
+                }
+                
+            }
+        }
+    }
+}
+
+

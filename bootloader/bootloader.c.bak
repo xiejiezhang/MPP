@@ -1,0 +1,77 @@
+#include "bootloader.h"
+
+static bootDrv_t gbootDrv;
+
+/**
+ * Mode 1: The program contains only the bootloader and APP1
+ */
+void mode1UpgradeAndRun(void *p_arg)
+{
+    unsigned char cmd = gbootDrv.pfnBootCmdGet_t(p_arg);
+    
+    if ( cmd == REQ_UPGRADE) {
+        gbootDrv.pfnBootCmdSet_t(p_arg, REQ_CLRCMD);
+    } else {
+        gbootDrv.pfnBootCmdSet_t(p_arg, REQ_UPGRADE);
+        if (gbootDrv.pfnApp1Check(p_arg)) {
+            
+            gbootDrv.pfnApp1Run(p_arg);
+        }
+    }
+}
+
+/**
+ * Mode 2: The program contains only bootloader and APP1, 
+ * APP2 three parts, APP2 can be used as backup of APP1
+ */
+void mode2UpgradeAndRun(void)
+{
+    unsigned char cmd = gbootDrv.pfnBootCmdGet_t(p_arg);
+    
+    if ( cmd == REQ_UPGRADE) {
+        gbootDrv.pfnBootCmdSet_t(p_arg, REQ_CLRCMD);
+    } else {
+       if (cmd == REQ_RUNAPP2) {
+            if (gbootDrv.pfnApp2Check(p_arg)) {
+                gbootDrv.pfnBootCmdSet_t(p_arg, REQ_UPGRADE);
+                gbootDrv.pfnApp2Run(p_arg);
+            }
+        } else {
+            gbootDrv.pfnBootCmdSet_t(p_arg, REQ_UPGRADE);
+            if (gbootDrv.pfnApp1Check(p_arg)) {
+                gbootDrv.pfnBootCmdSet_t(p_arg, REQ_RUNAPP2);
+                gbootDrv.pfnApp1Run(p_arg);
+            } else {
+                gbootDrv.pfnBootCmdSet_t(p_arg, REQ_UPGRADE);
+                if (gbootDrv.pfnApp2Check(p_arg)) {
+                    gbootDrv.pfnBootCmdSet_t(p_arg, REQ_UPGRADE);
+                    gbootDrv.pfnApp2Run(p_arg);
+                }
+            }
+        }
+    }
+}
+
+typedef void (*pfnUpgradeCheck_t)(void);
+
+/**
+ * Initialize the bootloader driver
+ */
+pfnUpgradeCheck_t bootDrvInit(bootDrv_t *pBootDrv);
+
+pfnUpgradeCheck_t bootDrvInit(bootDrv_t *pBootDrv);
+{
+    if (pBootDrv.pfnApp2Run_t && pBootDrv.pfnApp2Check_t) {
+        return mode2UpgradeAndRun;
+    } else {
+        return mode1UpgradeAndRun;
+    }
+}
+
+void bootloaderRun(bootDrv_t *pBootDrv)
+{
+    pfnUpgradeCheck_t pfnRun;
+
+    pfnRun = bootDrvInit(pBootDrv);
+    pfnRun();
+}
